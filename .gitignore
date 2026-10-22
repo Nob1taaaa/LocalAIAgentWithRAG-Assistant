@@ -1,0 +1,10 @@
+.env
+.env.*
+!.env.example
+__pycache__/
+*.py[cod]
+knowledge_base_db/
+chrome_langchain_db/
+.venv/
+venv/
+*.sqlite3
