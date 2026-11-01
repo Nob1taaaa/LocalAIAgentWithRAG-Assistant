@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import csv
+import math
 import hashlib
 import os
 import re
 import zipfile
+from collections import Counter, defaultdict
 from pathlib import Path
 from xml.etree import ElementTree
 
@@ -23,8 +25,18 @@ DB_DIRECTORY = str(
     else Path(__file__).resolve().parent / _configured_db_directory
 )
 EMBEDDING_MODEL = os.environ.get("OLLAMA_EMBEDDING_MODEL", "mxbai-embed-large")
+OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/")
+MAX_LEXICAL_INDEX_DOCUMENTS = int(os.environ.get("RAG_MAX_LEXICAL_INDEX_DOCUMENTS", "20000"))
+_LEXICAL_CACHE: dict[str, list[Document]] = {}
+_TOKEN_RE = re.compile(r"[a-z0-9_]+", re.IGNORECASE)
+_STOP_WORDS = set("a an and are as at be by for from has have how i in is it its of on or that the this to was were what when where which who why with about tell me explain".split())
 
-embeddings = OllamaEmbeddings(model=EMBEDDING_MODEL)
+EMBEDDING_KEEP_ALIVE = int(os.environ.get("OLLAMA_EMBEDDING_KEEP_ALIVE", "600"))
+embeddings = OllamaEmbeddings(
+    model=EMBEDDING_MODEL,
+    base_url=OLLAMA_BASE_URL,
+    keep_alive=EMBEDDING_KEEP_ALIVE,
+)
 vector_store = Chroma(
     collection_name="user_knowledge",
     persist_directory=DB_DIRECTORY,
@@ -33,8 +45,9 @@ vector_store = Chroma(
 
 
 def _split_text(text: str, chunk_size: int = 1400, overlap: int = 200) -> list[str]:
-    """Split text into overlapping chunks, preferring paragraph boundaries."""
-    text = re.sub(r"\s+", " ", text).strip()
+    """Split text into overlapping chunks while retaining paragraph boundaries."""
+    paragraphs = [re.sub(r"\s+", " ", item).strip() for item in re.split(r"\n\s*\n", text)]
+    text = "\n\n".join(item for item in paragraphs if item)
     if not text:
         return []
 
@@ -43,7 +56,8 @@ def _split_text(text: str, chunk_size: int = 1400, overlap: int = 200) -> list[s
     while start < len(text):
         end = min(start + chunk_size, len(text))
         if end < len(text):
-            boundary = text.rfind(". ", start + chunk_size // 2, end)
+            floor = start + chunk_size // 2
+            boundary = max(text.rfind("\n\n", floor, end), text.rfind(". ", floor, end))
             if boundary != -1:
                 end = boundary + 1
         chunk = text[start:end].strip()
@@ -93,7 +107,7 @@ def _read_file(path: Path) -> list[tuple[str, dict[str, int]]]:
             text = "".join(node.text or "" for node in paragraph.findall(".//w:t", namespace))
             if text.strip():
                 paragraphs.append(text)
-        return [("\n".join(paragraphs), {})]
+        return [("\n\n".join(paragraphs), {})]
 
     return []
 
@@ -141,15 +155,17 @@ def add_path(path_text: str, workspace: str) -> tuple[int, list[str]]:
                 documents.append(Document(page_content=chunk, metadata=metadata))
                 ids.append(_document_id(workspace, source_path, location, chunk))
 
+        # Re-indexing replaces old content, including when the source is now empty.
+        existing = vector_store._collection.get(
+            where={"$and": [{"workspace": workspace}, {"source_path": source_path}]},
+            include=["metadatas"],
+        )
+        if existing["ids"]:
+            vector_store.delete(ids=existing["ids"])
+            _LEXICAL_CACHE.clear()
         if documents:
-            # Re-indexing a file replaces its old chunks instead of duplicating them.
-            existing = vector_store._collection.get(
-                where={"$and": [{"workspace": workspace}, {"source_path": source_path}]},
-                include=["metadatas"],
-            )
-            if existing["ids"]:
-                vector_store.delete(ids=existing["ids"])
             vector_store.add_documents(documents=documents, ids=ids)
+            _LEXICAL_CACHE.clear()
             indexed += len(documents)
             sources.append(file_path.name)
 
@@ -157,19 +173,87 @@ def add_path(path_text: str, workspace: str) -> tuple[int, list[str]]:
 
 
 def retrieve(question: str, workspace: str, limit: int = 5) -> list[Document]:
-    """Search a single workspace, or all workspaces when workspace is 'all'."""
+    """Hybrid semantic and BM25 keyword retrieval, fused using reciprocal rank."""
+    question = question.strip()
+    if not question:
+        return []
+    if not 1 <= limit <= 20:
+        raise ValueError("Retrieval limit must be between 1 and 20.")
     if vector_store._collection.count() == 0:
         return []
-    if workspace == "all":
-        return vector_store.similarity_search(question, k=limit)
-    matches = vector_store._collection.get(where={"workspace": workspace})
-    if not matches.get("ids"):
-        return []
-    return vector_store.similarity_search(
-        question,
-        k=limit,
-        filter={"workspace": workspace},
+
+    candidate_limit = min(max(limit * 4, 20), 100)
+    search_filter = None if workspace == "all" else {"workspace": workspace}
+    semantic_docs = vector_store.similarity_search(question, k=candidate_limit, filter=search_filter)
+    lexical_docs = _bm25_search(question, workspace, candidate_limit)
+
+    # Reciprocal rank fusion rewards chunks surfaced by both search methods.
+    fused: dict[tuple, tuple[float, Document]] = {}
+    for ranked in (semantic_docs, lexical_docs):
+        for rank, document in enumerate(ranked, start=1):
+            key = _document_key(document)
+            score, _ = fused.get(key, (0.0, document))
+            fused[key] = (score + 1.0 / (60 + rank), document)
+    return [item[1] for item in sorted(fused.values(), key=lambda item: item[0], reverse=True)[:limit]]
+
+
+def _document_key(document: Document) -> tuple:
+    metadata = document.metadata or {}
+    return (
+        metadata.get("workspace"), metadata.get("source_path"), metadata.get("page"),
+        metadata.get("row"), metadata.get("chunk"), document.page_content,
     )
+
+
+def _tokens(text: str) -> list[str]:
+    return [token.lower() for token in _TOKEN_RE.findall(text) if token.lower() not in _STOP_WORDS]
+
+
+def _workspace_documents(workspace: str) -> list[Document] | None:
+    """Load and cache the bounded lexical corpus, or None for oversized indexes."""
+    cache_key = workspace
+    if cache_key in _LEXICAL_CACHE:
+        return _LEXICAL_CACHE[cache_key]
+    where = None if workspace == "all" else {"workspace": workspace}
+    count = vector_store._collection.count() if where is None else len(
+        vector_store._collection.get(where=where, include=["metadatas"]).get("ids", [])
+    )
+    if count > MAX_LEXICAL_INDEX_DOCUMENTS:
+        return None
+    result = vector_store._collection.get(where=where, include=["documents", "metadatas"])
+    documents = [
+        Document(page_content=text or "", metadata=metadata or {})
+        for text, metadata in zip(result.get("documents") or [], result.get("metadatas") or [])
+    ]
+    _LEXICAL_CACHE[cache_key] = documents
+    return documents
+
+
+def _bm25_search(question: str, workspace: str, limit: int) -> list[Document]:
+    query_terms = set(_tokens(question))
+    if not query_terms:
+        return []
+    documents = _workspace_documents(workspace)
+    if not documents:
+        return []
+    tokenized = [_tokens(document.page_content) for document in documents]
+    document_frequency = Counter(term for terms in tokenized for term in set(terms))
+    average_length = sum(map(len, tokenized)) / max(1, len(tokenized))
+    total = len(documents)
+    scores = []
+    for document, terms in zip(documents, tokenized):
+        frequencies = Counter(terms)
+        length_norm = 1.5 * (1 - 0.75 + 0.75 * len(terms) / max(1, average_length))
+        score = 0.0
+        for term in query_terms:
+            frequency = frequencies[term]
+            if frequency:
+                inverse_frequency = math.log(1 + (total - document_frequency[term] + 0.5) / (document_frequency[term] + 0.5))
+                score += inverse_frequency * (frequency * 2.5 / (frequency + length_norm))
+        if score > 0:
+            scores.append((score, document))
+    scores.sort(key=lambda item: item[0], reverse=True)
+    return [document for _, document in scores[:limit]]
 
 
 def list_sources(workspace: str) -> list[dict[str, str | int]]:
@@ -200,4 +284,5 @@ def remove_source(source_name: str, workspace: str) -> int:
     ids = result.get("ids") or []
     if ids:
         vector_store.delete(ids=ids)
+        _LEXICAL_CACHE.clear()
     return len(ids)

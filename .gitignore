@@ -8,3 +8,5 @@ chrome_langchain_db/
 .venv/
 venv/
 *.sqlite3
+agent.log.jsonl
+.DS_Store

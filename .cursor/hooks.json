@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "hooks": {
+    "workspaceOpen": [
+      { "command": "python3 .cursor/hooks/start_ollama_proxy.py", "timeout": 3 }
+    ],
+    "afterFileEdit": [
+      { "command": "python3 .cursor/hooks/record_edit.py", "timeout": 5 }
+    ],
+    "afterTabFileEdit": [
+      { "command": "python3 .cursor/hooks/record_edit.py", "timeout": 5 }
+    ]
+  }
+}

@@ -1,0 +1,67 @@
+name: Assist Ledger CI telemetry
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  report:
+    if: github.event.workflow_run.event == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send completed PR workflow metadata to Assist Ledger
+        env:
+          ASSIST_LEDGER_INGEST_KEY: ${{ secrets.ASSIST_LEDGER_INGEST_KEY }}
+          SUPABASE_PUBLISHABLE_KEY: ${{ vars.SUPABASE_PUBLISHABLE_KEY }}
+          EVENT_PATH: ${{ github.event_path }}
+        run: |
+          python - <<'PY'
+          import datetime as dt
+          import json
+          import os
+          import sys
+          import urllib.error
+          import urllib.request
+
+          key = os.environ.get("ASSIST_LEDGER_INGEST_KEY", "")
+          if not key:
+              print("ASSIST_LEDGER_INGEST_KEY is not configured; skipping ledger report.")
+              sys.exit(0)
+
+          with open(os.environ["EVENT_PATH"], encoding="utf-8") as event_file:
+              run = json.load(event_file)["workflow_run"]
+          numbers = [int(pr["number"]) for pr in run.get("pull_requests", []) if pr.get("number")]
+          if not numbers:
+              print("Workflow run is not attached to a PR; no ledger row created.")
+              sys.exit(0)
+
+          started = dt.datetime.fromisoformat(run["run_started_at"].replace("Z", "+00:00"))
+          completed = dt.datetime.fromisoformat(run["updated_at"].replace("Z", "+00:00"))
+          payload = {
+              "repository": os.environ["GITHUB_REPOSITORY"],
+              "pull_request_numbers": numbers,
+              "workflow_run_id": int(run["id"]),
+              "workflow_name": run["name"],
+              "conclusion": run["conclusion"] or "failure",
+              "duration_seconds": max(0, int((completed - started).total_seconds())),
+              "completed_at": completed.isoformat(),
+              "url": run["html_url"],
+          }
+          request = urllib.request.Request(
+              "https://wlofowatstpdckgknmeb.supabase.co/functions/v1/record-ci-run",
+              data=json.dumps(payload).encode("utf-8"),
+              headers={"Content-Type": "application/json", "x-assist-ledger-key": key, **({"apikey": os.environ["SUPABASE_PUBLISHABLE_KEY"]} if os.environ.get("SUPABASE_PUBLISHABLE_KEY") else {})},
+              method="POST",
+          )
+          try:
+              with urllib.request.urlopen(request, timeout=15) as response:
+                  print(f"Assist Ledger accepted workflow result (HTTP {response.status}).")
+          except (urllib.error.URLError, TimeoutError) as error:
+              print(f"Could not report workflow result to Assist Ledger: {error}", file=sys.stderr)
+              sys.exit(1)
+          PY
